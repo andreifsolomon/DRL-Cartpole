@@ -11,14 +11,15 @@ import torch.nn.functional as F
 import torch.optim as optim
 from segment_tree import *
 
-from prioritized_replay_buffer import PrioritizedReplayBuffer
+# from prioritized_replay_buffer import PrioritizedReplayBuffer
 
 BUFFER_SIZE = int(1e5)  # replay buffer size
-BATCH_SIZE = 128  # minibatch size
+BATCH_SIZE = 512  # minibatch size
 GAMMA = 0.99  # discount factor
+ALPHA = 0.5 # prioritization level (ALPHA=0 is uniform sampling so no prioritization)
 TAU = 1e-3  # for soft update of target parameters
-LR = 5e-4  # learning rate
-UPDATE_EVERY = 4  # how often to update the network
+LR = 5e-3  # learning rate
+UPDATE_EVERY = 10  # how often to update the network
 
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
@@ -26,7 +27,7 @@ device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 class Agent():
     """Interacts with and learns from the environment."""
 
-    def __init__(self, state_size, action_size, seed, double_dqn=False):
+    def __init__(self, state_size, action_size, seed):
         """Initialize an Agent object.
 
         Params
@@ -35,38 +36,34 @@ class Agent():
             action_size (int): dimension of each action
             seed (int): random seed
         """
-        self.double_dqn = double_dqn
 
         self.state_size = state_size[0]
         self.action_size = action_size
         self.seed = random.seed(seed)
 
-        # Q-Network
+        # DuelQNetwork
         self.qnetwork_local = DuelQNetwork(self.state_size, self.action_size, seed).to(device)
         self.qnetwork_target = DuelQNetwork(self.state_size, self.action_size, seed).to(device)
         self.optimizer = optim.Adam(self.qnetwork_local.parameters(), lr=LR)
 
-        # Replay memory
-        # self.memory = ReplayBuffer(action_size, BUFFER_SIZE, BATCH_SIZE, seed)
-        # self.memory = PrioritizedReplayBuffer(action_size, BUFFER_SIZE, BATCH_SIZE, seed, alpha=1)
-        self.memory = PrioritizedReplayBuffer(100000)
+        # Prioritized Experienced Replay memory
+        self.memory = PrioritizedReplayBuffer(action_size, BUFFER_SIZE, BATCH_SIZE, seed)
         # Initialize time step (for updating every UPDATE_EVERY steps)
         self.t_step = 0
 
-    def step(self, state, action, reward, next_state, done):
+    def step(self, state, action, reward, next_state, done, beta=1.):
         # Save experience in replay memory
-        # self.memory.add(state, action, reward, next_state, done)
-        experience = state, action, reward, next_state, done
-        self.memory.store(experience)
+        self.memory.add(state, action, reward, next_state, done)
 
-        # Learn every UPDATE_EVERY time steps.
+        # Learn every update_every time steps.
         self.t_step = (self.t_step + 1) % UPDATE_EVERY
         if self.t_step == 0:
             # If enough samples are available in memory, get random subset and learn
-            # if len(self.memory) > BATCH_SIZE:
-                # experiences = self.memory.sample()
-            tree_idx, batch, ISWeights_mb = self.memory.sample(BATCH_SIZE)
-            self.learn(tree_idx, list(zip(*batch)), GAMMA)
+            if len(self.memory) > BATCH_SIZE:
+                experiences = self.memory.sample(ALPHA, beta)
+                # Is line below required? Don't think so looks like no-op ...
+                # action_values = self.qnetwork_local(experiences[0])
+                self.learn(experiences, GAMMA)
 
     def act(self, state, eps=0.):
         """Returns actions for given state as per current policy.
@@ -88,7 +85,7 @@ class Agent():
         else:
             return random.choice(np.arange(self.action_size))
 
-    def learn(self, indexes, experiences, gamma):
+    def learn(self, experiences, gamma):
         """Update value parameters using given batch of experience tuples.
 
         Params
@@ -96,59 +93,34 @@ class Agent():
             experiences (Tuple[torch.Variable]): tuple of (s, a, r, s', done) tuples
             gamma (float): discount factor
         """
-        states, actions, rewards, next_states, dones = experiences
+        states, actions, rewards, next_states, dones, weights, indices = experiences
 
-        states = torch.tensor(states).float().to(device)
-        actions = torch.tensor(actions).long().to(device)
-        rewards = torch.tensor(rewards).float().to(device)
-        next_states = torch.tensor(next_states).float().to(device)
-        dones = torch.tensor(dones).float().to(device)
+        # Get max action from local model
+        local_max_actions = self.qnetwork_local(next_states).detach().max(1)[1].unsqueeze(1)
 
-        if self.double_dqn:
-            _, best_actions = self.qnetwork_local(next_states).detach().max(dim=1)
-            Q_targets_next = self.qnetwork_target(states).gather(1, best_actions.view(-1,1))
+        # Get max predicted Q values (for next states) from target model
+        Q_targets_next = torch.gather(self.qnetwork_target(next_states).detach(), 1, local_max_actions)
 
-            # Compute Q targets for current states
-            Q_targets = rewards + (gamma * Q_targets_next * (1 - dones))
-            # Get expected Q values from local model
-            Q_expected = self.qnetwork_local(states).gather(1, actions)
+        # Compute Q targets for current states
+        Q_targets = rewards + (gamma * Q_targets_next * (1 - dones))
 
-            for i in range(BATCH_SIZE):
-                if dones[i].item() == 1.0:
-                    Q_targets[i] = rewards[i]
+        # Get expected Q values from local model
+        Q_expected = self.qnetwork_local(states).gather(1, actions)
 
-            delta = torch.clamp(Q_targets - Q_expected, -1., 1.)
-            loss = torch.sum(torch.pow(delta, 2))
+        # Compute loss
+        # loss = F.mse_loss(Q_expected, Q_targets)
+        loss = (Q_expected - Q_targets).pow(2) * weights
+        adjusted_loss = loss + 1e-5
+        loss = loss.mean()
 
-            self.optimizer.zero_grad()
-            loss.backward()
-
-        else:
-            Q_targets_next = self.qnetwork_target(next_states).detach().max(1)[0].unsqueeze(1)
-            # Compute Q targets for current states
-            # Q_targets = rewards + (gamma * Q_targets_next * (1 - dones))
-            Q_targets = rewards.view(-1, 1) + (gamma * Q_targets_next * (1 - dones.view(-1, 1)))
-
-            # Get expected Q values from local model
-            Q_expected = self.qnetwork_local(states).gather(1, actions.view(-1,1))
-
-            # Compute loss
-            # loss = F.mse_loss(Q_expected, Q_targets)
-            delta = torch.clamp(Q_targets - Q_expected, -1., 1.)
-            loss = torch.pow(delta, 2)
-
-            # Minimize the loss
-            self.optimizer.zero_grad()
-            loss.backward()
-
-        loss_data = loss.detach().squeeze(1).data.numpy()
-        for i in range(len(loss_data)):
-            update_index = indexes[i]
-            priority = loss_data[i]
-            self.memory.update(update_index, priority)
-
-
+        # Minimize the loss
+        self.optimizer.zero_grad()
+        loss.backward()
         self.optimizer.step()
+
+        # Update priorities based on td error
+        self.memory.update_priorities(indices.squeeze().to(device).data.numpy(), adjusted_loss.squeeze().to(device).data.numpy())
+
         # ------------------- update target network ------------------- #
         self.soft_update(self.qnetwork_local, self.qnetwork_target, TAU)
 
@@ -209,116 +181,116 @@ class ReplayBuffer:
         return len(self.memory)
 
 
-# class PrioritizedReplayBuffer(ReplayBuffer):
-#     def __init__(self, action_size, buffer_size, batch_size, seed, alpha):
-#         """Create Prioritized Replay buffer.
-#         Parameters
-#         ----------
-#         size: int
-#             Max number of transitions to store in the buffer. When the buffer
-#             overflows the old memories are dropped.
-#         alpha: float
-#             how much prioritization is used
-#             (0 - no prioritization, 1 - full prioritization)
-#         See Also
-#         --------
-#         ReplayBuffer.__init__
-#         """
-#         super(PrioritizedReplayBuffer, self).__init__(action_size, buffer_size, batch_size, seed)
-#         assert alpha >= 0
-#         self._alpha = alpha
-#
-#         it_capacity = 1
-#         while it_capacity < buffer_size:
-#             it_capacity *= 2
-#
-#         self._it_sum = SumSegmentTree(it_capacity)
-#         self._it_min = MinSegmentTree(it_capacity)
-#         self._max_priority = 1.0
-#
-#     def add(self, *args, **kwargs):
-#         """See ReplayBuffer.store_effect"""
-#         idx = self._next_idx
-#         super().add(*args, **kwargs)
-#         self._it_sum[idx] = self._max_priority ** self._alpha
-#         self._it_min[idx] = self._max_priority ** self._alpha
-#
-#     def _sample_proportional(self, batch_size):
-#         res = []
-#         p_total = self._it_sum.sum(0, len(self._storage) - 1)
-#         every_range_len = p_total / batch_size
-#         for i in range(batch_size):
-#             mass = random.random() * every_range_len + i * every_range_len
-#             idx = self._it_sum.find_prefixsum_idx(mass)
-#             res.append(idx)
-#         return res
-#
-#     def sample(self, batch_size, beta):
-#         """Sample a batch of experiences.
-#         compared to ReplayBuffer.sample
-#         it also returns importance weights and idxes
-#         of sampled experiences.
-#         Parameters
-#         ----------
-#         batch_size: int
-#             How many transitions to sample.
-#         beta: float
-#             To what degree to use importance weights
-#             (0 - no corrections, 1 - full correction)
-#         Returns
-#         -------
-#         obs_batch: np.array
-#             batch of observations
-#         act_batch: np.array
-#             batch of actions executed given obs_batch
-#         rew_batch: np.array
-#             rewards received as results of executing act_batch
-#         next_obs_batch: np.array
-#             next set of observations seen after executing act_batch
-#         done_mask: np.array
-#             done_mask[i] = 1 if executing act_batch[i] resulted in
-#             the end of an episode and 0 otherwise.
-#         weights: np.array
-#             Array of shape (batch_size,) and dtype np.float32
-#             denoting importance weight of each sampled transition
-#         idxes: np.array
-#             Array of shape (batch_size,) and dtype np.int32
-#             idexes in buffer of sampled experiences
-#         """
-#         assert beta > 0
-#
-#         idxes = self._sample_proportional(batch_size)
-#
-#         weights = []
-#         p_min = self._it_min.min() / self._it_sum.sum()
-#         max_weight = (p_min * len(self._storage)) ** (-beta)
-#
-#         for idx in idxes:
-#             p_sample = self._it_sum[idx] / self._it_sum.sum()
-#             weight = (p_sample * len(self._storage)) ** (-beta)
-#             weights.append(weight / max_weight)
-#         weights = np.array(weights)
-#         encoded_sample = self._encode_sample(idxes)
-#         return tuple(list(encoded_sample) + [weights, idxes])
-#
-#     def update_priorities(self, idxes, priorities):
-#         """Update priorities of sampled transitions.
-#         sets priority of transition at index idxes[i] in buffer
-#         to priorities[i].
-#         Parameters
-#         ----------
-#         idxes: [int]
-#             List of idxes of sampled transitions
-#         priorities: [float]
-#             List of updated priorities corresponding to
-#             transitions at the sampled idxes denoted by
-#             variable `idxes`.
-#         """
-#         assert len(idxes) == len(priorities)
-#         for idx, priority in zip(idxes, priorities):
-#             assert priority > 0
-#             assert 0 <= idx < len(self._storage)
-#             self._it_sum[idx] = priority ** self._alpha
-#             self._it_min[idx] = priority ** self._alpha
-#
-#             self._max_priority = max(self._max_priority, priority)
+class PrioritizedReplayBuffer:
+    """Naive Prioritized Experience Replay buffer to store experience tuples."""
+
+    def __init__(self, action_size, buffer_size, batch_size, seed):
+        """Initialize a ReplayBuffer object.
+        Params
+        ======
+            action_size (int): dimension of each action
+            buffer_size (int): maximum size of buffer
+            batch_size (int): size of each training batch
+            seed (int): random seed
+        """
+        self.action_size = action_size
+        self.memory = deque(maxlen=buffer_size)
+        self.batch_size = batch_size
+        self.experience = namedtuple("Experience",
+                                     field_names=["state", "action", "reward", "next_state", "done", "priority"])
+        self.seed = random.seed(seed)
+
+    def add(self, state, action, reward, next_state, done):
+        """Add a new experience to memory."""
+        # By default set max priority level
+        max_priority = max([m.priority for m in self.memory]) if self.memory else 1.0
+        e = self.experience(state, action, reward, next_state, done, max_priority)
+        self.memory.append(e)
+
+    def sample(self, alpha, beta):
+        """Randomly sample a batch of experiences from memory."""
+
+        # Probabilities associated with each entry in memory
+        priorities = np.array([sample.priority for sample in self.memory])
+        probs = priorities ** alpha
+        probs /= probs.sum()
+
+        # Get indices
+        indices = np.random.choice(len(self.memory), self.batch_size, replace=False, p=probs)
+
+        # Associated experiences
+        experiences = [self.memory[idx] for idx in indices]
+
+        # Importance sampling weights
+        total = len(self.memory)
+        weights = (total * probs[indices]) ** (-beta)
+        weights /= weights.max()
+        weights = np.array(weights, dtype=np.float32)
+
+        states = torch.from_numpy(np.vstack([e.state for e in experiences if e is not None])).float().to(device)
+        actions = torch.from_numpy(np.vstack([e.action for e in experiences if e is not None])).long().to(device)
+        rewards = torch.from_numpy(np.vstack([e.reward for e in experiences if e is not None])).float().to(device)
+        next_states = torch.from_numpy(np.vstack([e.next_state for e in experiences if e is not None])).float().to(
+            device)
+        dones = torch.from_numpy(np.vstack([e.done for e in experiences if e is not None]).astype(np.uint8)).float().to(
+            device)
+        weights = torch.from_numpy(np.vstack(weights)).float().to(device)
+        indices = torch.from_numpy(np.vstack(indices)).long().to(device)
+        return (states, actions, rewards, next_states, dones, weights, indices)
+
+    def update_priorities(self, indices, priorities):
+        for i, idx in enumerate(indices):
+            # A tuple is immutable so need to use "_replace" method to update it - might replace the named tuple by a dict
+            self.memory[idx] = self.memory[idx]._replace(priority=priorities[i])
+
+    def __len__(self):
+        """Return the current size of internal memory."""
+        return len(self.memory)
+
+
+#from: https://github.com/jaara/AI-blog/blob/master/Seaquest-DDQN-PER.py
+#credits to: Jaromir Janisch
+"""
+The Memory that is used for Prioritized Experience Replay
+"""
+
+from sum_tree import SumTree
+class Replay_Memory:
+    def __init__(self):
+        global MEMORY_LEN
+        self.tree = SumTree(MEMORY_LEN)
+
+    def add(self, error, sample):
+        global MEMORY_BIAS, MEMORY_POW
+        priority = (error + MEMORY_BIAS) ** MEMORY_POW
+        self.tree.add(priority, sample)
+
+    def sample(self):
+        """
+         Get a sample batch of the replay memory
+        Returns:
+         batch: a batch with one sample from each segment of the memory
+        """
+        global BATCH_SIZE
+        batch = []
+        #we want one representative of all distribution-segments in the batch
+        #e.g BATCH_SIZE=2: batch contains one sample from [min,median]
+        #and from [median,max]
+        segment = self.tree.total() / BATCH_SIZE
+        for i in range(BATCH_SIZE):
+            minimum = segment * i
+            maximum = segment * (i+1)
+            s = random.uniform(minimum, maximum)
+            (idx, p, data) = self.tree.get(s)
+            batch.append((idx, data))
+        return batch
+
+    def update(self, idx, error):
+        """
+         Updates one entry in the replay memory
+        Args:
+         idx: the position of the outdated transition in the memory
+         error: the newly calculated error
+        """
+        priority = (error + MEMORY_BIAS) ** MEMORY_POW
+        self.tree.update(idx, priority)
